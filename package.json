@@ -1,0 +1,37 @@
+{
+  "name": "reddit-research-mcp",
+  "version": "2.0.0",
+  "description": "MCP server for Reddit research using Serper API and Reddit OAuth",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "reddit-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "reddit",
+    "serper",
+    "search",
+    "ai",
+    "model-context-protocol"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

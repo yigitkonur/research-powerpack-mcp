@@ -2,9 +2,6 @@
 name: NPM Release
 
 on:
-  push:
-    paths:
-      - '.github/workflows/npmrelease.yml'
   workflow_dispatch:
     inputs:
       bump:

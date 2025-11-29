@@ -58,6 +58,14 @@ export class ScraperClient {
 
     const apiUrl = `${this.baseURL}?${params.toString()}`;
 
+    // ============================================================
+    // Scrape.do Status Code Handling (based on official docs)
+    // ============================================================
+    // RETRY (no credit consumed): 429, 502, 510
+    // NO RETRY: 404 (permanent), 401 (no credits), 400 (bad request)
+    // SUCCESS: 2xx (consumes credit)
+    // ============================================================
+
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         const response = await fetch(apiUrl, {
@@ -65,51 +73,89 @@ export class ScraperClient {
           headers: { Accept: 'text/html,application/json' },
         });
 
-        if (!response.ok) {
-          const errorText = await response.text().catch(() => '');
-
-          if (response.status === 429) {
-            if (attempt < maxRetries - 1) {
-              const delay = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-              console.error(`[Scraper] Rate limited (429). Retry ${attempt + 1}/${maxRetries} after ${delay}ms`);
-              await this.delay(delay);
-              continue;
-            }
-            throw new Error('Scraper rate limited. Try fewer URLs or retry later.');
-          }
-
-          if (response.status >= 400 && response.status < 500) {
-            throw new Error(`Scraper API error: ${response.status} ${errorText}`);
-          }
-
-          if (attempt < maxRetries - 1) {
-            const delay = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-            console.error(`[Scraper] Retry ${attempt + 1}/${maxRetries} after ${delay}ms (status: ${response.status})`);
-            await this.delay(delay);
-            continue;
-          }
-
-          throw new Error(`Scraper API error: ${response.status} ${errorText}`);
-        }
-
         const content = await response.text();
         const credits = mode === 'javascript' ? 5 : 1;
 
-        return {
-          content,
-          statusCode: response.status,
-          credits,
-          headers: Object.fromEntries(response.headers.entries()),
-        };
+        // SUCCESS: 2xx - Successful API call (consumes credit)
+        if (response.ok) {
+          return {
+            content,
+            statusCode: response.status,
+            credits,
+            headers: Object.fromEntries(response.headers.entries()),
+          };
+        }
+
+        // RETRY: 429 - Rate limited (no credit consumed)
+        if (response.status === 429) {
+          if (attempt < maxRetries - 1) {
+            const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
+            console.error(`[Scraper] Rate limited (429) - no credit used. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
+            await this.delay(delayMs);
+            continue;
+          }
+          throw new Error('Rate limited (429). Try fewer concurrent URLs or retry later.');
+        }
+
+        // RETRY: 502 - Request failed (no credit consumed)
+        if (response.status === 502) {
+          if (attempt < maxRetries - 1) {
+            const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
+            console.error(`[Scraper] Request failed (502) - no credit used. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
+            await this.delay(delayMs);
+            continue;
+          }
+          throw new Error('Request failed (502). Please try again.');
+        }
+
+        // RETRY: 510 - Request canceled by HTTP client (no credit consumed)
+        if (response.status === 510) {
+          if (attempt < maxRetries - 1) {
+            const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
+            console.error(`[Scraper] Request canceled (510) - no credit used. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
+            await this.delay(delayMs);
+            continue;
+          }
+          throw new Error('Request canceled (510). Please try again.');
+        }
+
+        // NO RETRY: 404 - Target not found (consumes credit, permanent error)
+        if (response.status === 404) {
+          return { content: '404 - Target not found', statusCode: 404, credits };
+        }
+
+        // NO RETRY: 401 - No credits or subscription suspended (no credit consumed)
+        if (response.status === 401) {
+          throw new Error('No credits remaining or subscription suspended (401). Check your Scrape.do account.');
+        }
+
+        // NO RETRY: 400 - Bad request (may or may not consume credit, permanent error)
+        if (response.status === 400) {
+          throw new Error(`Bad request (400): ${content.substring(0, 200)}`);
+        }
+
+        // Other unexpected errors - retry if attempts remaining
+        if (attempt < maxRetries - 1) {
+          const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
+          console.error(`[Scraper] Unexpected status (${response.status}). Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
+          await this.delay(delayMs);
+          continue;
+        }
+
+        throw new Error(`Scraper error: ${response.status} ${content.substring(0, 200)}`);
       } catch (error) {
         if (attempt === maxRetries - 1) {
           throw new Error(`Failed to scrape URL after ${maxRetries} attempts: ${error instanceof Error ? error.message : String(error)}`);
         }
 
-        if (error instanceof Error && !error.message.includes('API error') && !error.message.includes('rate limited')) {
-          const delay = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-          console.error(`[Scraper] Network error, retry ${attempt + 1}/${maxRetries} after ${delay}ms: ${error.message}`);
-          await this.delay(delay);
+        // Network errors - retry with backoff
+        if (error instanceof Error && 
+            !error.message.includes('(401)') && 
+            !error.message.includes('(400)') &&
+            !error.message.includes('Target not found')) {
+          const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
+          console.error(`[Scraper] Error: ${error.message}. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
+          await this.delay(delayMs);
         } else {
           throw error;
         }

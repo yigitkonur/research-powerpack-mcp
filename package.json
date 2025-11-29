@@ -15,7 +15,14 @@
     "prepublishOnly": "npm run build",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:web-search": "tsx tests/test-web-search.ts",
+    "test:reddit-search": "tsx tests/test-reddit-search.ts",
+    "test:scrape-links": "tsx tests/test-scrape-links.ts",
+    "test:deep-research": "tsx tests/test-deep-research.ts",
+    "test:parallel": "tsx tests/parallel-test-runner.ts",
+    "test:all": "npm run test:web-search && npm run test:reddit-search && npm run test:scrape-links && npm run test:deep-research",
+    "test:check": "tsx tests/check-setup.ts"
   },
   "keywords": [
     "mcp",
@@ -49,6 +56,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/turndown": "^5.0.6",
+    "dotenv": "^17.2.3",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0"
   },

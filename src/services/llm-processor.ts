@@ -47,6 +47,8 @@ export async function processContentWithLLM(
     : `Clean and extract the main content from the following text, removing navigation, ads, and irrelevant elements:\n\n${content}`;
 
   try {
+    console.error(`[LLM Processor] Using model: ${LLM_EXTRACTION.MODEL}, max_tokens: ${config.max_tokens || LLM_EXTRACTION.MAX_TOKENS}`);
+    
     const response = await processor.chat.completions.create({
       model: LLM_EXTRACTION.MODEL,
       messages: [{ role: 'user', content: prompt }],
@@ -55,11 +57,13 @@ export async function processContentWithLLM(
 
     const result = response.choices?.[0]?.message?.content;
     if (result) {
+      console.error(`[LLM Processor] Successfully extracted ${result.length} characters`);
       return { content: result, processed: true };
     }
     return { content, processed: false, error: 'No content in response' };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);
+    console.error(`[LLM Processor] Error: ${error}`);
     return { content, processed: false, error };
   }
 }

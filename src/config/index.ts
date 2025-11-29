@@ -132,6 +132,6 @@ export const CTR_WEIGHTS: Record<number, number> = {
 // ============================================================================
 
 export const LLM_EXTRACTION = {
-  MODEL: process.env.LLM_EXTRACTION_MODEL || 'openrouter/gpt-oss-120b:nitro',
+  MODEL: process.env.LLM_EXTRACTION_MODEL || 'openai/gpt-4o-mini',
   MAX_TOKENS: 8000,
 } as const;

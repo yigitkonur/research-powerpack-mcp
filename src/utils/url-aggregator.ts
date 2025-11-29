@@ -5,7 +5,7 @@
  */
 
 import { CTR_WEIGHTS } from '../config/index.js';
-import type { KeywordSearchResult } from '../clients/search.js';
+import type { KeywordSearchResult, RedditSearchResult } from '../clients/search.js';
 
 /**
  * Aggregated URL data structure
@@ -332,4 +332,256 @@ export function buildUrlLookup(rankedUrls: RankedUrl[]): Map<string, RankedUrl> 
 export function lookupUrl(url: string, lookup: Map<string, RankedUrl>): RankedUrl | undefined {
   const normalized = normalizeUrl(url);
   return lookup.get(normalized) || lookup.get(url.toLowerCase());
+}
+
+// ============================================================================
+// Reddit-Specific Aggregation
+// ============================================================================
+
+/**
+ * Aggregated Reddit URL data structure
+ */
+interface AggregatedRedditUrl {
+  url: string;
+  title: string;
+  snippet: string;
+  date?: string;
+  frequency: number;
+  positions: number[];
+  queries: string[];
+  bestPosition: number;
+  totalScore: number;
+}
+
+/**
+ * Ranked Reddit URL with normalized score
+ */
+export interface RankedRedditUrl {
+  url: string;
+  title: string;
+  snippet: string;
+  date?: string;
+  rank: number;
+  score: number;
+  frequency: number;
+  positions: number[];
+  queries: string[];
+  bestPosition: number;
+  isConsensus: boolean;
+}
+
+/**
+ * Reddit aggregation result
+ */
+export interface RedditAggregationResult {
+  rankedUrls: RankedRedditUrl[];
+  totalUniqueUrls: number;
+  totalQueries: number;
+  frequencyThreshold: number;
+  thresholdNote?: string;
+}
+
+/**
+ * Aggregate Reddit search results from multiple queries
+ */
+function aggregateRedditResults(
+  searches: Map<string, RedditSearchResult[]>
+): Map<string, AggregatedRedditUrl> {
+  const urlMap = new Map<string, AggregatedRedditUrl>();
+
+  let queryIndex = 0;
+  for (const [query, results] of searches) {
+    for (let i = 0; i < results.length; i++) {
+      const result = results[i];
+      const position = i + 1;
+      const normalizedUrl = normalizeUrl(result.url);
+      const existing = urlMap.get(normalizedUrl);
+
+      if (existing) {
+        existing.frequency += 1;
+        existing.positions.push(position);
+        existing.queries.push(query);
+        existing.bestPosition = Math.min(existing.bestPosition, position);
+        existing.totalScore += getCtrWeight(position);
+        // Keep best title/snippet (from highest position)
+        if (position < existing.positions[0]) {
+          existing.title = result.title;
+          existing.snippet = result.snippet;
+          existing.date = result.date;
+        }
+      } else {
+        urlMap.set(normalizedUrl, {
+          url: result.url,
+          title: result.title,
+          snippet: result.snippet,
+          date: result.date,
+          frequency: 1,
+          positions: [position],
+          queries: [query],
+          bestPosition: position,
+          totalScore: getCtrWeight(position),
+        });
+      }
+    }
+    queryIndex++;
+  }
+
+  return urlMap;
+}
+
+/**
+ * Filter Reddit URLs by minimum frequency
+ */
+function filterRedditByFrequency(
+  urlMap: Map<string, AggregatedRedditUrl>,
+  minFrequency: number
+): AggregatedRedditUrl[] {
+  const filtered: AggregatedRedditUrl[] = [];
+  
+  for (const url of urlMap.values()) {
+    if (url.frequency >= minFrequency) {
+      filtered.push(url);
+    }
+  }
+
+  return filtered;
+}
+
+/**
+ * Calculate weighted scores for Reddit URLs
+ */
+function calculateRedditWeightedScores(urls: AggregatedRedditUrl[]): RankedRedditUrl[] {
+  if (urls.length === 0) return [];
+
+  // Sort by total score descending
+  const sorted = [...urls].sort((a, b) => b.totalScore - a.totalScore);
+
+  // Find max score for normalization
+  const maxScore = sorted[0].totalScore;
+
+  // Map to ranked URLs with normalized scores
+  return sorted.map((url, index) => ({
+    url: url.url,
+    title: url.title,
+    snippet: url.snippet,
+    date: url.date,
+    rank: index + 1,
+    score: maxScore > 0 ? (url.totalScore / maxScore) * 100 : 0,
+    frequency: url.frequency,
+    positions: url.positions,
+    queries: url.queries,
+    bestPosition: url.bestPosition,
+    isConsensus: url.frequency >= 2, // Lower threshold for Reddit (often fewer results)
+  }));
+}
+
+/**
+ * Full Reddit aggregation pipeline with fallback thresholds
+ */
+export function aggregateAndRankReddit(
+  searches: Map<string, RedditSearchResult[]>,
+  minConsensusUrls: number = 3
+): RedditAggregationResult {
+  const urlMap = aggregateRedditResults(searches);
+  const totalUniqueUrls = urlMap.size;
+  const totalQueries = searches.size;
+
+  // Try thresholds in order: 2, 1 (Reddit often has less overlap than web search)
+  const thresholds = [2, 1];
+  let rankedUrls: RankedRedditUrl[] = [];
+  let usedThreshold = 2;
+  let thresholdNote: string | undefined;
+
+  for (const threshold of thresholds) {
+    const filtered = filterRedditByFrequency(urlMap, threshold);
+    rankedUrls = calculateRedditWeightedScores(filtered);
+
+    if (rankedUrls.length >= minConsensusUrls || threshold === 1) {
+      usedThreshold = threshold;
+      if (threshold < 2 && totalQueries > 1) {
+        thresholdNote = `Note: Frequency filter set to ≥${threshold} due to result diversity across queries.`;
+      }
+      break;
+    }
+  }
+
+  return {
+    rankedUrls,
+    totalUniqueUrls,
+    totalQueries,
+    frequencyThreshold: usedThreshold,
+    thresholdNote,
+  };
+}
+
+/**
+ * Generate enhanced output for Reddit aggregated results
+ */
+export function generateRedditEnhancedOutput(
+  aggregation: RedditAggregationResult,
+  allQueries: string[]
+): string {
+  const { rankedUrls, totalUniqueUrls, frequencyThreshold, thresholdNote } = aggregation;
+  const lines: string[] = [];
+
+  // Header
+  lines.push(`# 🔍 Reddit Search Results (Aggregated from ${allQueries.length} Queries)`);
+  lines.push('');
+  lines.push(`**Total Unique Posts:** ${totalUniqueUrls} | **Consensus Threshold:** ≥${frequencyThreshold} appearances`);
+  lines.push('');
+
+  if (thresholdNote) {
+    lines.push(`> ${thresholdNote}`);
+    lines.push('');
+  }
+
+  // Consensus section (URLs appearing in multiple queries)
+  const consensusUrls = rankedUrls.filter(u => u.frequency >= frequencyThreshold && u.frequency > 1);
+  if (consensusUrls.length > 0) {
+    lines.push('## ⭐ High-Consensus Posts (Multiple Queries)');
+    lines.push('');
+    lines.push('*These posts appeared across multiple search queries, indicating high relevance:*');
+    lines.push('');
+
+    for (const url of consensusUrls) {
+      const dateStr = url.date ? ` • 📅 ${url.date}` : '';
+      const queriesList = url.queries.map(q => `"${q}"`).join(', ');
+      lines.push(`### #${url.rank}: ${url.title}`);
+      lines.push(`**Score:** ${url.score.toFixed(1)} | **Found in:** ${url.frequency} queries (${queriesList})${dateStr}`);
+      lines.push(`${url.url}`);
+      lines.push(`> ${url.snippet}`);
+      lines.push('');
+    }
+
+    lines.push('---');
+    lines.push('');
+  }
+
+  // All results ranked by CTR score
+  lines.push('## 📊 All Results (CTR-Ranked)');
+  lines.push('');
+
+  for (const url of rankedUrls) {
+    const dateStr = url.date ? ` • 📅 ${url.date}` : '';
+    const consensusMarker = url.frequency > 1 ? ' ⭐' : '';
+    lines.push(`**${url.rank}. ${url.title}**${consensusMarker}${dateStr}`);
+    lines.push(`${url.url}`);
+    lines.push(`> ${url.snippet}`);
+    if (url.frequency > 1) {
+      lines.push(`_Found in ${url.frequency} queries: ${url.queries.map(q => `"${q}"`).join(', ')}_`);
+    }
+    lines.push('');
+  }
+
+  // Metadata
+  lines.push('---');
+  lines.push('');
+  lines.push('### 📈 Search Metadata');
+  lines.push('');
+  lines.push(`- **Queries:** ${allQueries.map(q => `"${q}"`).join(', ')}`);
+  lines.push(`- **Unique Posts Found:** ${totalUniqueUrls}`);
+  lines.push(`- **High-Consensus Posts:** ${consensusUrls.length}`);
+  lines.push('');
+
+  return lines.join('\n');
 }

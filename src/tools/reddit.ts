@@ -4,6 +4,7 @@
 
 import { SearchClient } from '../clients/search.js';
 import { RedditClient, calculateCommentAllocation, type PostResult, type Comment } from '../clients/reddit.js';
+import { aggregateAndRankReddit, generateRedditEnhancedOutput } from '../utils/url-aggregator.js';
 import { REDDIT } from '../config/index.js';
 
 // ============================================================================
@@ -56,22 +57,21 @@ export async function handleSearchReddit(
   const client = new SearchClient(apiKey);
   const results = await client.searchRedditMultiple(limited, dateAfter);
 
-  let md = '';
-  for (const [query, items] of results) {
-    md += `## 🔍 "${query}"${dateAfter ? ` (after ${dateAfter})` : ''}\n\n`;
-    if (items.length === 0) {
-      md += '_No results found_\n\n';
-      continue;
-    }
-    for (let i = 0; i < items.length; i++) {
-      const r = items[i];
-      const dateStr = r.date ? ` • 📅 ${r.date}` : '';
-      md += `**${i + 1}. ${r.title}**${dateStr}\n`;
-      md += `${r.url}\n`;
-      md += `> ${r.snippet}\n\n`;
-    }
+  // Check if any results were found
+  let totalResults = 0;
+  for (const items of results.values()) {
+    totalResults += items.length;
   }
-  return md.trim();
+
+  if (totalResults === 0) {
+    return `# 🔍 Reddit Search Results\n\n_No results found for any of the ${limited.length} queries._`;
+  }
+
+  // Aggregate and rank results by CTR
+  const aggregation = aggregateAndRankReddit(results, 3);
+
+  // Generate enhanced output with consensus highlighting
+  return generateRedditEnhancedOutput(aggregation, limited);
 }
 
 // ============================================================================

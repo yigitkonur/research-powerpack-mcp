@@ -1,8 +1,8 @@
-# NPM Release Workflow v3
+# NPM Release Workflow v4 - Smart Auto-Bump
 name: NPM Release
 
 on:
-  # Auto-publish on push (no version bump - you control version locally)
+  # Auto-publish on push with smart version checking
   push:
     branches:
       - main
@@ -47,16 +47,42 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Version Bump (manual only)
+      - name: Check if version already published
+        id: version_check
+        run: |
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          echo "current_version=$PACKAGE_VERSION" >> $GITHUB_OUTPUT
+          
+          # Check if version exists on npm
+          if npm view research-powerpack-mcp@$PACKAGE_VERSION version 2>/dev/null; then
+            echo "version_exists=true" >> $GITHUB_OUTPUT
+            echo "Version $PACKAGE_VERSION already exists on npm"
+          else
+            echo "version_exists=false" >> $GITHUB_OUTPUT
+            echo "Version $PACKAGE_VERSION is new and will be published"
+          fi
+
+      - name: Auto Version Bump (if version exists)
+        if: steps.version_check.outputs.version_exists == 'true' && github.event_name == 'push'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          npm version patch -m "chore: auto bump version to %s [skip ci]"
+          git push
+          git push --tags
+          echo "Auto-bumped to $(node -p "require('./package.json').version")"
+
+      - name: Manual Version Bump
         if: ${{ inputs.bump != '' }}
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "9989650+yigitkonur@users.noreply.github.com"
-          npm version ${{ inputs.bump }} -m "release: %s"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          npm version ${{ inputs.bump }} -m "release: %s [skip ci]"
           git push
           git push --tags
 
-      - name: Publish
+      - name: Publish to NPM
+        if: steps.version_check.outputs.version_exists == 'false' || inputs.bump != ''
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

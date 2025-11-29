@@ -111,7 +111,7 @@ export const REDDIT = {
 } as const;
 
 // ============================================================================
-// CTR Weights for URL Ranking (inspired fro CTR thing)
+// CTR Weights for URL Ranking (inspired from CTR research)
 // ============================================================================
 
 export const CTR_WEIGHTS: Record<number, number> = {

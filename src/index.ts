@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 
+/**
+ * Research Powerpack MCP Server
+ * Implements robust error handling - server NEVER crashes on tool failures
+ */
+
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -12,7 +17,7 @@ import { handleWebSearch } from './tools/search.js';
 import { deepResearchParamsSchema } from './schemas/deep-research.js';
 import { scrapeLinksParamsSchema } from './schemas/scrape-links.js';
 import { webSearchParamsSchema } from './schemas/web-search.js';
-import { createSimpleError } from './utils/errors.js';
+import { classifyError, ErrorCode, type StructuredError } from './utils/errors.js';
 import { parseEnv, RESEARCH, SERVER, getCapabilities, getMissingEnvMessage } from './config/index.js';
 
 // ============================================================================
@@ -154,11 +159,52 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
     return { content: [{ type: 'text', text: `⚠️ **Unknown tool:** \`${name}\`\n\nAvailable tools: search_reddit, get_reddit_post, deep_research, scrape_links, web_search` }], isError: true };
   } catch (error) {
-    const simpleError = createSimpleError(error);
-    // Format error as helpful markdown
-    const errorText = `## ❌ Error\n\n**${simpleError.code}:** ${simpleError.message}\n\nPlease check your input parameters and try again.`;
+    // Classify the error for helpful messaging
+    const structuredError = classifyError(error);
+
+    // Log for debugging
+    console.error(`[MCP Server] Tool "${name}" error:`, {
+      code: structuredError.code,
+      message: structuredError.message,
+      retryable: structuredError.retryable,
+    });
+
+    // Format user-friendly error message
+    const retryHint = structuredError.retryable ? '\n\n💡 This error may be temporary. Try again in a moment.' : '';
+    const errorText = `## ❌ Error\n\n**${structuredError.code}:** ${structuredError.message}${retryHint}\n\nPlease check your input parameters and try again.`;
+
+    // ALWAYS return a valid response - never let the server crash
     return { content: [{ type: 'text', text: errorText }], isError: true };
   }
+});
+
+// ============================================================================
+// Global Error Handlers - Prevent server crashes
+// ============================================================================
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error: Error) => {
+  console.error('[MCP Server] Uncaught exception (server continues):', error.message);
+  // Don't exit - the server should continue running
+});
+
+// Handle unhandled promise rejections
+process.on('unhandledRejection', (reason: unknown) => {
+  const error = classifyError(reason);
+  console.error('[MCP Server] Unhandled rejection (server continues):', error.message);
+  // Don't exit - the server should continue running
+});
+
+// Handle SIGTERM gracefully
+process.on('SIGTERM', () => {
+  console.error('[MCP Server] Received SIGTERM, shutting down gracefully');
+  process.exit(0);
+});
+
+// Handle SIGINT gracefully (Ctrl+C)
+process.on('SIGINT', () => {
+  console.error('[MCP Server] Received SIGINT, shutting down gracefully');
+  process.exit(0);
 });
 
 // ============================================================================
@@ -166,5 +212,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 // ============================================================================
 
 const transport = new StdioServerTransport();
-server.connect(transport);
-console.error(`🚀 ${SERVER.NAME} v${SERVER.VERSION} ready`);
+
+// Connect with error handling
+try {
+  server.connect(transport);
+  console.error(`🚀 ${SERVER.NAME} v${SERVER.VERSION} ready`);
+} catch (error) {
+  const err = classifyError(error);
+  console.error(`[MCP Server] Failed to start: ${err.message}`);
+  process.exit(1);
+}

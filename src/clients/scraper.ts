@@ -1,9 +1,17 @@
 /**
  * Web Scraper Client
  * Generic interface for URL scraping with automatic fallback modes
+ * Implements robust error handling that NEVER crashes
  */
 
 import { parseEnv, SCRAPER } from '../config/index.js';
+import {
+  classifyError,
+  fetchWithTimeout,
+  sleep,
+  ErrorCode,
+  type StructuredError,
+} from '../utils/errors.js';
 
 export interface ScrapeRequest {
   url: string;
@@ -17,6 +25,7 @@ export interface ScrapeResponse {
   statusCode: number;
   credits: number;
   headers?: Record<string, string>;
+  error?: StructuredError;
 }
 
 export interface BatchScrapeResult {
@@ -25,6 +34,11 @@ export interface BatchScrapeResult {
   totalAttempted: number;
   rateLimitHits: number;
 }
+
+// Status codes that indicate we should retry (no credit consumed)
+const RETRYABLE_STATUS_CODES = new Set([429, 502, 503, 504, 510]);
+// Status codes that are permanent failures (don't retry)
+const PERMANENT_FAILURE_CODES = new Set([400, 401, 403]);
 
 export class ScraperClient {
   private apiKey: string;
@@ -39,8 +53,25 @@ export class ScraperClient {
     }
   }
 
+  /**
+   * Scrape a single URL with retry logic
+   * NEVER throws - always returns a ScrapeResponse (possibly with error)
+   */
   async scrape(request: ScrapeRequest, maxRetries = SCRAPER.RETRY_COUNT): Promise<ScrapeResponse> {
     const { url, mode = 'basic', timeout = 30, country } = request;
+    const credits = mode === 'javascript' ? 5 : 1;
+
+    // Validate URL first
+    try {
+      new URL(url);
+    } catch {
+      return {
+        content: `Invalid URL: ${url}`,
+        statusCode: 400,
+        credits: 0,
+        error: { code: ErrorCode.INVALID_INPUT, message: `Invalid URL: ${url}`, retryable: false },
+      };
+    }
 
     const params = new URLSearchParams({
       url: url,
@@ -57,26 +88,27 @@ export class ScraperClient {
     }
 
     const apiUrl = `${this.baseURL}?${params.toString()}`;
-
-    // ============================================================
-    // Scrape.do Status Code Handling (based on official docs)
-    // ============================================================
-    // RETRY (no credit consumed): 429, 502, 510
-    // NO RETRY: 404 (permanent), 401 (no credits), 400 (bad request)
-    // SUCCESS: 2xx (consumes credit)
-    // ============================================================
+    let lastError: StructuredError | undefined;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        const response = await fetch(apiUrl, {
+        // Use AbortController for timeout
+        const timeoutMs = (timeout + 10) * 1000; // Add 10s buffer over scrape timeout
+        const response = await fetchWithTimeout(apiUrl, {
           method: 'GET',
           headers: { Accept: 'text/html,application/json' },
+          timeoutMs,
         });
 
-        const content = await response.text();
-        const credits = mode === 'javascript' ? 5 : 1;
+        // Safely read response body
+        let content: string;
+        try {
+          content = await response.text();
+        } catch (readError) {
+          content = `Failed to read response: ${readError instanceof Error ? readError.message : String(readError)}`;
+        }
 
-        // SUCCESS: 2xx - Successful API call (consumes credit)
+        // SUCCESS: 2xx - Successful API call
         if (response.ok) {
           return {
             content,
@@ -86,85 +118,112 @@ export class ScraperClient {
           };
         }
 
-        // RETRY: 429 - Rate limited (no credit consumed)
-        if (response.status === 429) {
-          if (attempt < maxRetries - 1) {
-            const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-            console.error(`[Scraper] Rate limited (429) - no credit used. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
-            await this.delay(delayMs);
-            continue;
-          }
-          throw new Error('Rate limited (429). Try fewer concurrent URLs or retry later.');
-        }
-
-        // RETRY: 502 - Request failed (no credit consumed)
-        if (response.status === 502) {
-          if (attempt < maxRetries - 1) {
-            const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-            console.error(`[Scraper] Request failed (502) - no credit used. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
-            await this.delay(delayMs);
-            continue;
-          }
-          throw new Error('Request failed (502). Please try again.');
-        }
-
-        // RETRY: 510 - Request canceled by HTTP client (no credit consumed)
-        if (response.status === 510) {
-          if (attempt < maxRetries - 1) {
-            const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-            console.error(`[Scraper] Request canceled (510) - no credit used. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
-            await this.delay(delayMs);
-            continue;
-          }
-          throw new Error('Request canceled (510). Please try again.');
-        }
-
-        // NO RETRY: 404 - Target not found (consumes credit, permanent error)
+        // 404 - Target not found (permanent, but not an error for our purposes)
         if (response.status === 404) {
-          return { content: '404 - Target not found', statusCode: 404, credits };
+          return {
+            content: '404 - Page not found',
+            statusCode: 404,
+            credits,
+          };
         }
 
-        // NO RETRY: 401 - No credits or subscription suspended (no credit consumed)
-        if (response.status === 401) {
-          throw new Error('No credits remaining or subscription suspended (401). Check your Scrape.do account.');
+        // Permanent failures - don't retry
+        if (PERMANENT_FAILURE_CODES.has(response.status)) {
+          const errorMsg = response.status === 401
+            ? 'No credits remaining or subscription suspended'
+            : `Request failed with status ${response.status}`;
+          return {
+            content: `Error: ${errorMsg}`,
+            statusCode: response.status,
+            credits: 0,
+            error: {
+              code: response.status === 401 ? ErrorCode.AUTH_ERROR : ErrorCode.INVALID_INPUT,
+              message: errorMsg,
+              retryable: false,
+              statusCode: response.status,
+            },
+          };
         }
 
-        // NO RETRY: 400 - Bad request (may or may not consume credit, permanent error)
-        if (response.status === 400) {
-          throw new Error(`Bad request (400): ${content.substring(0, 200)}`);
+        // Retryable status codes
+        if (RETRYABLE_STATUS_CODES.has(response.status)) {
+          lastError = {
+            code: response.status === 429 ? ErrorCode.RATE_LIMITED : ErrorCode.SERVICE_UNAVAILABLE,
+            message: `Server returned ${response.status}`,
+            retryable: true,
+            statusCode: response.status,
+          };
+
+          if (attempt < maxRetries - 1) {
+            const delayMs = this.calculateBackoff(attempt);
+            console.error(`[Scraper] ${response.status} on attempt ${attempt + 1}/${maxRetries}. Retrying in ${delayMs}ms`);
+            await sleep(delayMs);
+            continue;
+          }
         }
 
-        // Other unexpected errors - retry if attempts remaining
-        if (attempt < maxRetries - 1) {
-          const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-          console.error(`[Scraper] Unexpected status (${response.status}). Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
-          await this.delay(delayMs);
+        // Other non-success status - treat as retryable
+        lastError = classifyError({ status: response.status, message: content });
+        if (attempt < maxRetries - 1 && lastError.retryable) {
+          const delayMs = this.calculateBackoff(attempt);
+          console.error(`[Scraper] Status ${response.status}. Retrying in ${delayMs}ms`);
+          await sleep(delayMs);
           continue;
         }
 
-        throw new Error(`Scraper error: ${response.status} ${content.substring(0, 200)}`);
+        // Final attempt failed
+        return {
+          content: `Error: ${lastError.message}`,
+          statusCode: response.status,
+          credits: 0,
+          error: lastError,
+        };
+
       } catch (error) {
-        if (attempt === maxRetries - 1) {
-          throw new Error(`Failed to scrape URL after ${maxRetries} attempts: ${error instanceof Error ? error.message : String(error)}`);
+        lastError = classifyError(error);
+
+        // Non-retryable errors - return immediately
+        if (!lastError.retryable) {
+          return {
+            content: `Error: ${lastError.message}`,
+            statusCode: lastError.statusCode || 500,
+            credits: 0,
+            error: lastError,
+          };
         }
 
-        // Network errors - retry with backoff
-        if (error instanceof Error && 
-            !error.message.includes('(401)') && 
-            !error.message.includes('(400)') &&
-            !error.message.includes('Target not found')) {
-          const delayMs = SCRAPER.RETRY_DELAYS[attempt] || 8000;
-          console.error(`[Scraper] Error: ${error.message}. Retry ${attempt + 1}/${maxRetries} after ${delayMs}ms`);
-          await this.delay(delayMs);
-        } else {
-          throw error;
+        // Retryable error - continue if attempts remaining
+        if (attempt < maxRetries - 1) {
+          const delayMs = this.calculateBackoff(attempt);
+          console.error(`[Scraper] ${lastError.code}: ${lastError.message}. Retry ${attempt + 1}/${maxRetries} in ${delayMs}ms`);
+          await sleep(delayMs);
+          continue;
         }
       }
     }
 
-    throw new Error('Unexpected retry loop exit');
+    // All retries exhausted
+    return {
+      content: `Error: Failed after ${maxRetries} attempts. ${lastError?.message || 'Unknown error'}`,
+      statusCode: lastError?.statusCode || 500,
+      credits: 0,
+      error: lastError || { code: ErrorCode.UNKNOWN_ERROR, message: 'All retries exhausted', retryable: false },
+    };
   }
 
+  /**
+   * Calculate exponential backoff with jitter
+   */
+  private calculateBackoff(attempt: number): number {
+    const baseDelay = SCRAPER.RETRY_DELAYS[attempt] || 8000;
+    const jitter = Math.random() * 0.3 * baseDelay;
+    return Math.floor(baseDelay + jitter);
+  }
+
+  /**
+   * Scrape with automatic fallback through different modes
+   * NEVER throws - always returns a ScrapeResponse
+   */
   async scrapeWithFallback(url: string, options: { timeout?: number } = {}): Promise<ScrapeResponse> {
     const attempts: Array<{ mode: 'basic' | 'javascript'; country?: string; description: string }> = [
       { mode: 'basic', description: 'basic mode' },
@@ -173,40 +232,66 @@ export class ScraperClient {
     ];
 
     const attemptResults: string[] = [];
+    let lastResult: ScrapeResponse | null = null;
 
     for (const attempt of attempts) {
-      try {
-        const result = await this.scrape({
-          url,
-          mode: attempt.mode,
-          timeout: options.timeout,
-          country: attempt.country,
-        });
+      // scrape() never throws, so no try-catch needed
+      const result = await this.scrape({
+        url,
+        mode: attempt.mode,
+        timeout: options.timeout,
+        country: attempt.country,
+      });
 
-        if (result.statusCode >= 200 && result.statusCode < 300) {
-          if (attemptResults.length > 0) {
-            console.error(`[Scraper] Success with ${attempt.description} after ${attemptResults.length} failed attempt(s)`);
-          }
-          return result;
+      lastResult = result;
+
+      // Success
+      if (result.statusCode >= 200 && result.statusCode < 300 && !result.error) {
+        if (attemptResults.length > 0) {
+          console.error(`[Scraper] Success with ${attempt.description} after ${attemptResults.length} fallback(s)`);
         }
-
-        if (result.statusCode === 404) {
-          return { content: '404 - Page not found', statusCode: 404, credits: result.credits };
-        }
-
-        attemptResults.push(`${attempt.description}: ${result.statusCode}`);
-        console.error(`[Scraper] Failed with ${attempt.description} (status: ${result.statusCode}), trying next fallback...`);
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        attemptResults.push(`${attempt.description}: ${msg}`);
-        console.error(`[Scraper] Error with ${attempt.description}: ${msg}`);
+        return result;
       }
+
+      // 404 is a valid response, not an error
+      if (result.statusCode === 404) {
+        return result;
+      }
+
+      // Non-retryable errors - don't try other modes
+      if (result.error && !result.error.retryable) {
+        console.error(`[Scraper] Non-retryable error with ${attempt.description}: ${result.error.message}`);
+        return result;
+      }
+
+      // Collect failure reason and try next mode
+      attemptResults.push(`${attempt.description}: ${result.error?.message || result.statusCode}`);
+      console.error(`[Scraper] Failed with ${attempt.description} (${result.statusCode}), trying next fallback...`);
     }
 
-    throw new Error(`Failed to scrape ${url} after trying all fallback modes:\n${attemptResults.join('\n')}`);
+    // All fallbacks exhausted - return last result with aggregated error info
+    const errorMessage = `Failed after ${attempts.length} fallback modes: ${attemptResults.join('; ')}`;
+    return {
+      content: `Error: ${errorMessage}`,
+      statusCode: lastResult?.statusCode || 500,
+      credits: 0,
+      error: {
+        code: ErrorCode.SERVICE_UNAVAILABLE,
+        message: errorMessage,
+        retryable: false,
+      },
+    };
   }
 
+  /**
+   * Scrape multiple URLs with batching
+   * NEVER throws - always returns results array
+   */
   async scrapeMultiple(urls: string[], options: { timeout?: number } = {}): Promise<Array<ScrapeResponse & { url: string }>> {
+    if (urls.length === 0) {
+      return [];
+    }
+
     if (urls.length <= SCRAPER.BATCH_SIZE) {
       return this.processBatch(urls, options);
     }
@@ -215,6 +300,10 @@ export class ScraperClient {
     return result.results;
   }
 
+  /**
+   * Batch scrape with progress callback
+   * NEVER throws - uses Promise.allSettled internally
+   */
   async batchScrape(
     urls: string[],
     options: { timeout?: number } = {},
@@ -233,6 +322,7 @@ export class ScraperClient {
 
       console.error(`[Scraper] Processing batch ${batchNum + 1}/${totalBatches} (${batchUrls.length} URLs)`);
 
+      // Promise.allSettled never throws
       const batchResults = await Promise.allSettled(
         batchUrls.map(url => this.scrapeWithFallback(url, options))
       );
@@ -242,41 +332,69 @@ export class ScraperClient {
         const url = batchUrls[i] || '';
 
         if (result.status === 'fulfilled') {
-          allResults.push({ ...result.value, url });
-        } else {
-          const errorMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+          const scrapeResult = result.value;
+          allResults.push({ ...scrapeResult, url });
 
-          if (errorMsg.includes('rate limited') || errorMsg.includes('429')) {
+          // Track rate limits
+          if (scrapeResult.error?.code === ErrorCode.RATE_LIMITED) {
             rateLimitHits++;
           }
+        } else {
+          // This shouldn't happen since scrapeWithFallback never throws,
+          // but handle it gracefully just in case
+          const errorMsg = result.reason instanceof Error ? result.reason.message : String(result.reason);
+          console.error(`[Scraper] Unexpected rejection for ${url}: ${errorMsg}`);
 
-          allResults.push({ url, content: `Error: ${errorMsg}`, statusCode: 500, credits: 0 });
+          allResults.push({
+            url,
+            content: `Error: Unexpected failure - ${errorMsg}`,
+            statusCode: 500,
+            credits: 0,
+            error: classifyError(result.reason),
+          });
         }
       }
 
-      onBatchComplete?.(batchNum + 1, totalBatches, allResults.length);
+      // Safe callback invocation
+      try {
+        onBatchComplete?.(batchNum + 1, totalBatches, allResults.length);
+      } catch (callbackError) {
+        console.error(`[Scraper] onBatchComplete callback error:`, callbackError);
+      }
+
       console.error(`[Scraper] Completed batch ${batchNum + 1}/${totalBatches} (${allResults.length}/${urls.length} total)`);
 
+      // Small delay between batches to avoid overwhelming the API
       if (batchNum < totalBatches - 1) {
-        await this.delay(500);
+        await sleep(500);
       }
     }
 
     return { results: allResults, batchesProcessed: totalBatches, totalAttempted: urls.length, rateLimitHits };
   }
 
+  /**
+   * Process a single batch of URLs
+   * NEVER throws
+   */
   private async processBatch(urls: string[], options: { timeout?: number }): Promise<Array<ScrapeResponse & { url: string }>> {
     const results = await Promise.allSettled(urls.map(url => this.scrapeWithFallback(url, options)));
 
     return results.map((result, index) => {
-      if (result.status === 'fulfilled') {
-        return { ...result.value, url: urls[index] || '' };
-      }
-      return { url: urls[index] || '', content: `Error: ${result.reason}`, statusCode: 500, credits: 0 };
-    });
-  }
+      const url = urls[index] || '';
 
-  private delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+      if (result.status === 'fulfilled') {
+        return { ...result.value, url };
+      }
+
+      // Shouldn't happen, but handle gracefully
+      return {
+        url,
+        content: `Error: ${result.reason instanceof Error ? result.reason.message : String(result.reason)}`,
+        statusCode: 500,
+        credits: 0,
+        error: classifyError(result.reason),
+      };
+    });
   }
 }

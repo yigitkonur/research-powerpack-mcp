@@ -1,16 +1,17 @@
 /**
  * Deep Research Tool Handler - Batch processing with dynamic token allocation
+ * Implements robust error handling that NEVER crashes
  */
 
 import type { DeepResearchParams } from '../schemas/deep-research.js';
 import { ResearchClient, type ResearchResponse } from '../clients/research.js';
 import { FileAttachmentService } from '../services/file-attachment.js';
 import { RESEARCH } from '../config/index.js';
-import { createSimpleError } from '../utils/errors.js';
+import { classifyError } from '../utils/errors.js';
 
 // Constants
 const TOTAL_TOKEN_BUDGET = 32000;
-const MIN_QUESTIONS = 2;
+const MIN_QUESTIONS = 1; // Allow single question for flexibility
 const MAX_QUESTIONS = 10;
 
 interface ResearchOptions {
@@ -27,7 +28,25 @@ interface QuestionResult {
 }
 
 function calculateTokenAllocation(questionCount: number): number {
+  if (questionCount <= 0) return TOTAL_TOKEN_BUDGET;
   return Math.floor(TOTAL_TOKEN_BUDGET / questionCount);
+}
+
+/**
+ * Safe logger wrapper - NEVER throws
+ */
+async function safeLog(
+  logger: ResearchOptions['logger'],
+  sessionId: string | undefined,
+  level: 'info' | 'error' | 'debug',
+  message: string
+): Promise<void> {
+  if (!logger || !sessionId) return;
+  try {
+    await logger(level, message, sessionId);
+  } catch {
+    console.error(`[Research Tool] Logger failed: ${message}`);
+  }
 }
 
 const SYSTEM_PROMPT = `You are an expert research consultant. Provide evidence-based, multi-perspective analysis.
@@ -47,18 +66,22 @@ FORMAT (high info density):
 
 Be dense with insights, light on filler. Use examples and citations.`;
 
+/**
+ * Handle deep research request
+ * NEVER throws - always returns a valid response
+ */
 export async function handleDeepResearch(
   params: DeepResearchParams,
   options: ResearchOptions = {}
 ): Promise<{ content: string; structuredContent: object }> {
   const { sessionId, logger } = options;
-  const questions = params.questions;
+  const questions = params.questions || [];
 
   // Validation
   if (questions.length < MIN_QUESTIONS) {
     return {
-      content: `# ❌ Error\n\nMinimum ${MIN_QUESTIONS} research questions required. Received: ${questions.length}`,
-      structuredContent: { error: true, message: `Minimum ${MIN_QUESTIONS} questions required` },
+      content: `# ❌ Error\n\nMinimum ${MIN_QUESTIONS} research question(s) required. Received: ${questions.length}`,
+      structuredContent: { error: true, message: `Minimum ${MIN_QUESTIONS} question(s) required` },
     };
   }
   if (questions.length > MAX_QUESTIONS) {
@@ -70,24 +93,39 @@ export async function handleDeepResearch(
 
   const tokensPerQuestion = calculateTokenAllocation(questions.length);
 
-  if (sessionId && logger) {
-    await logger('info', `Starting batch research: ${questions.length} questions, ${tokensPerQuestion.toLocaleString()} tokens/question`, sessionId);
+  await safeLog(logger, sessionId, 'info', `Starting batch research: ${questions.length} questions, ${tokensPerQuestion.toLocaleString()} tokens/question`);
+
+  // Initialize client safely
+  let client: ResearchClient;
+  try {
+    client = new ResearchClient();
+  } catch (error) {
+    const err = classifyError(error);
+    return {
+      content: `# ❌ Error\n\nFailed to initialize research client: ${err.message}`,
+      structuredContent: { error: true, message: `Failed to initialize: ${err.message}` },
+    };
   }
 
-  const client = new ResearchClient();
   const fileService = new FileAttachmentService();
   const results: QuestionResult[] = [];
 
-  // Process all questions in parallel
+  // Process all questions in parallel - each handler NEVER throws
   const researchPromises = questions.map(async (q, index): Promise<QuestionResult> => {
     try {
       // Enhance question with file attachments if present
       let enhancedQuestion = q.question;
       if (q.file_attachments && q.file_attachments.length > 0) {
-        const attachmentsMarkdown = await fileService.formatAttachments(q.file_attachments);
-        enhancedQuestion = q.question + attachmentsMarkdown;
+        try {
+          const attachmentsMarkdown = await fileService.formatAttachments(q.file_attachments);
+          enhancedQuestion = q.question + attachmentsMarkdown;
+        } catch {
+          // If attachment processing fails, continue with original question
+          console.error(`[Research] Failed to process attachments for question ${index + 1}`);
+        }
       }
 
+      // ResearchClient.research() now returns error in response instead of throwing
       const response = await client.research({
         question: enhancedQuestion,
         systemPrompt: SYSTEM_PROMPT,
@@ -96,19 +134,31 @@ export async function handleDeepResearch(
         maxTokens: tokensPerQuestion,
       });
 
+      // Check if response contains an error
+      if (response.error) {
+        return {
+          question: q.question,
+          content: response.content || '',
+          success: false,
+          error: response.error.message,
+        };
+      }
+
       return {
         question: q.question,
-        content: response.content,
-        success: true,
+        content: response.content || '',
+        success: !!response.content,
         tokensUsed: response.usage?.totalTokens,
+        error: response.content ? undefined : 'Empty response received',
       };
     } catch (error) {
-      const simpleError = createSimpleError(error);
+      // This catch is a safety net - ResearchClient should not throw
+      const structuredError = classifyError(error);
       return {
         question: q.question,
         content: '',
         success: false,
-        error: simpleError.message,
+        error: structuredError.message,
       };
     }
   });
@@ -142,9 +192,7 @@ export async function handleDeepResearch(
     markdown += `---\n\n`;
   }
 
-  if (sessionId && logger) {
-    await logger('info', `Research completed: ${successful.length}/${questions.length} successful, ${totalTokens.toLocaleString()} tokens`, sessionId);
-  }
+  await safeLog(logger, sessionId, 'info', `Research completed: ${successful.length}/${questions.length} successful, ${totalTokens.toLocaleString()} tokens`);
 
   return {
     content: markdown.trim(),

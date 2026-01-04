@@ -55,7 +55,7 @@ export type ToolRegistry = Record<string, ToolRegistration>;
 // ============================================================================
 
 const searchRedditParamsSchema = z.object({
-  queries: z.array(z.string()).min(3).max(50),
+  queries: z.array(z.string()).min(10).max(50),
   date_after: z.string().optional(),
 });
 

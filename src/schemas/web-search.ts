@@ -16,9 +16,9 @@ const keywordsSchema = z
     required_error: 'web_search: Keywords array is required',
     invalid_type_error: 'web_search: Keywords must be an array'
   })
-  .min(1, { message: 'web_search: At least 1 keyword is required' })
+  .min(3, { message: 'web_search: MINIMUM 3 keywords required. You provided {#}. Add {#} more diverse keywords covering different perspectives.' })
   .max(100, { message: 'web_search: Maximum 100 keywords allowed per request' })
-  .describe('Array of search keywords (1-100 keywords). Recommend 3-7 keywords for comprehensive research. Supports Google search operators (site:, -exclusion, "exact phrase", filetype:). More keywords = broader coverage and diverse perspectives.');
+  .describe('Array of search keywords (MINIMUM 3, RECOMMENDED 5-7, MAX 100). Each keyword runs as a separate Google search in parallel. Use diverse keywords covering different angles for comprehensive results.');
 
 const webSearchParamsShape = {
   keywords: keywordsSchema,

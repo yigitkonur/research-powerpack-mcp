@@ -624,6 +624,26 @@ npm run typecheck
 
 ---
 
+## 🏗️ Architecture (v3.4.0+)
+
+The codebase uses a **YAML-driven configuration system** for maintainability:
+
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Tool Definitions** | `src/config/yaml/tools.yaml` | Single source of truth for all tool metadata |
+| **Handler Registry** | `src/tools/registry.ts` | Declarative tool registration + `executeTool` wrapper |
+| **YAML Loader** | `src/config/loader.ts` | Parses YAML, generates MCP-compatible definitions |
+| **Shared Utils** | `src/tools/utils.ts` | Common utility functions |
+
+**Adding a new tool:**
+1. Add tool definition to `tools.yaml`
+2. Create handler in `src/tools/`
+3. Register in `src/tools/registry.ts`
+
+See `docs/refactoring/04-migration-guide.md` for detailed instructions.
+
+---
+
 ## 🔥 Common Issues & Quick Fixes
 
 <details>

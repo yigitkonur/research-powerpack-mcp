@@ -101,7 +101,7 @@ export const SERVER = {
 // Capability Detection (which features are available based on ENV)
 // ============================================================================
 
-interface Capabilities {
+export interface Capabilities {
   reddit: boolean;        // REDDIT_CLIENT_ID + REDDIT_CLIENT_SECRET
   search: boolean;        // SERPER_API_KEY
   scraping: boolean;      // SCRAPEDO_API_KEY
